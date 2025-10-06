@@ -1,9 +1,9 @@
 [project]
-name = "llm-happiness"
+name = "autonomous-research-agent"
 version = "0.1.0"
 description = ""
 authors = [
-    {name = "renatex333",email = "renato9302@hotmail.com"}
+    {name = "renatex333",email = "renatolf3@gmail.com"}
 ]
 readme = "README.md"
 requires-python = ">=3.12,<4.0.0"
@@ -16,10 +16,14 @@ dependencies = [
     "langchain-community (>=0.3.30,<0.4.0)",
     "langchain-tavily (>=0.2.11,<0.3.0)",
     "wikipedia (>=1.4.0,<2.0.0)",
-    "arxiv (>=2.2.0,<3.0.0)"
+    "arxiv (>=2.2.0,<3.0.0)",
+    "streamlit (>=1.50.0,<2.0.0)"
 ]
 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
