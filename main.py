@@ -5,18 +5,19 @@ import logging.config
 from typing import TypedDict, List, cast
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage
 from langchain_tavily import TavilySearch
-from langchain_community.tools import ArxivQueryRun
-from langchain_community.utilities.arxiv import ArxivAPIWrapper
 from langgraph.graph import StateGraph, END
+from langchain_core.messages import BaseMessage
+from langchain_community.tools import ArxivQueryRun
+from langchain_core.runnables import RunnableConfig
+from langchain_community.utilities.arxiv import ArxivAPIWrapper
 
 # --- Configurações e Constantes ---
 load_dotenv()
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 IS_DEBUG = LOG_LEVEL == "DEBUG"
-MAX_RETRIES = 1
+MAX_RETRIES = 3
 
 LOGGING_CONFIG = {
     "version": 1,
@@ -45,9 +46,21 @@ LOGGING_CONFIG = {
         },
     },
     "loggers": {
+        # Root logger (your app)
         "": {
             "handlers": ["console", "file"],
             "level": LOG_LEVEL,
+            "propagate": False,
+        },
+        # Suppress noisy modules (set to WARNING or higher)
+        "watchdog": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "watchdog.observers.inotify_buffer": {
+            "handlers": ["console"],
+            "level": "WARNING",
             "propagate": False,
         },
         "python_multipart": {
@@ -55,6 +68,17 @@ LOGGING_CONFIG = {
             "level": "WARNING",
             "propagate": False,
         },
+        "httpcore": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "openai": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        # Add other noisy modules here as needed
     }
 }
 
@@ -63,10 +87,13 @@ logger = logging.getLogger(__name__)
 
 # Verifica se as chaves foram carregadas
 if not os.getenv("OPENAI_API_KEY") or not os.getenv("TAVILY_API_KEY"):
-    logger.error("ERRO: Chaves de API não encontradas. Verifique seu arquivo .env")
+    logger.error(
+        "ERRO: Chaves de API não encontradas. Verifique seu arquivo .env")
     sys.exit()
 
 # --- Definições de Classes e Funções ---
+
+
 class ResearchState(TypedDict):
     """Representa o estado do grafo de pesquisa."""
     topic: str
@@ -80,12 +107,14 @@ class ResearchState(TypedDict):
     report_content: str
     tool_choice: str
 
+
 def configure_tools():
     """Inicializa as ferramentas e o modelo de linguagem."""
     web_search_tool = TavilySearch(max_results=3)
     arxiv_tool = ArxivQueryRun(api_wrapper=ArxivAPIWrapper())
     llm = ChatOpenAI(model="gpt-5-nano", temperature=0, service_tier="flex")
     return web_search_tool, arxiv_tool, llm
+
 
 def planner_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para planejar subtemas de pesquisa com base no tópico inicial."""
@@ -100,6 +129,7 @@ def planner_node(state: ResearchState, llm: ChatOpenAI):
     subtopics = str(response.content).strip().split("\n")
     logger.info("Subtemas gerados: %s", subtopics)
     return {"subtopics": subtopics, "current_query": subtopics[0] if subtopics else "", "retries": 0}
+
 
 def router_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para decidir qual ferramenta usar com base na query atual."""
@@ -119,15 +149,18 @@ def router_node(state: ResearchState, llm: ChatOpenAI):
     logger.info("Ferramenta escolhida: %s", tool_choice)
     return {"tool_choice": tool_choice}
 
+
 def tavily_search_node(state: ResearchState, web_search_tool: TavilySearch):
     """Nó para pesquisar na web usando a ferramenta Tavily."""
     logger.info("--- 🔍 NÓ DE PESQUISA (TAVILY) ---")
     retries = state.get("retries", 0) + 1
     topic = state["topic"]
     current_query = state["current_query"]
-    results = web_search_tool.invoke({"query": f"{topic}: {current_query}"}).get("results", "")
+    results = web_search_tool.invoke(
+        {"query": f"{topic}: {current_query}"}).get("results", "")
     # logger.info("Resultados da pesquisa (Tavily): %s", results)
     return {"search_results": results, "retries": retries}
+
 
 def arxiv_search_node(state: ResearchState, arxiv_tool: ArxivQueryRun):
     """Nó para pesquisar no ArXiv usando a ferramenta ArxivQueryRun."""
@@ -137,6 +170,7 @@ def arxiv_search_node(state: ResearchState, arxiv_tool: ArxivQueryRun):
     results = arxiv_tool.run(current_query)
     # logger.info("Resultados da pesquisa (ArXiv): %s", results)
     return {"search_results": results, "retries": retries}
+
 
 def analyze_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para analisar os resultados da pesquisa e decidir o próximo passo."""
@@ -174,6 +208,7 @@ def analyze_node(state: ResearchState, llm: ChatOpenAI):
         "report_content": state["report_content"]
     }
 
+
 def refine_query_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para refinar a consulta de pesquisa com base no feedback do LLM."""
     logger.info("--- 🔄 NÓ DE REFINAMENTO DE CONSULTA ---")
@@ -201,6 +236,7 @@ def refine_query_node(state: ResearchState, llm: ChatOpenAI):
     logger.info("Nova consulta sugerida: %s", new_query)
     return {"current_query": new_query}
 
+
 def write_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para gerar o relatório final com base nos resultados da pesquisa."""
     logger.info("--- ✍️ NÓ DE ESCRITA ---")
@@ -217,6 +253,7 @@ def write_node(state: ResearchState, llm: ChatOpenAI):
     report = response.content
     logger.info("Relatório gerado:\n%s", report)
     return {"report": report}
+
 
 def should_continue(state: ResearchState):
     """Decide se continua para a escrita ou volta para a pesquisa."""
@@ -239,17 +276,25 @@ def should_continue(state: ResearchState):
     logger.info("Conteúdo do relatório atual: %s", state["report_content"])
     return "continue" if "continue" in decision else "rewrite"
 
+
 def build_workflow(web_search_tool: TavilySearch, arxiv_tool: ArxivQueryRun, llm: ChatOpenAI):
     """Monta e compila o grafo de estados."""
     workflow = StateGraph(ResearchState)
 
-    workflow.add_node("planner", lambda state: planner_node(cast(ResearchState, state), llm))
-    workflow.add_node("router", lambda state: router_node(cast(ResearchState, state), llm))
-    workflow.add_node("tavily_search", lambda state: tavily_search_node(cast(ResearchState, state), web_search_tool))
-    workflow.add_node("arxiv_search", lambda state: arxiv_search_node(cast(ResearchState, state), arxiv_tool))
-    workflow.add_node("analyze", lambda state: analyze_node(cast(ResearchState, state), llm))
-    workflow.add_node("write", lambda state: write_node(cast(ResearchState, state), llm))
-    workflow.add_node("refine_query", lambda state: refine_query_node(cast(ResearchState, state), llm))
+    workflow.add_node("planner", lambda state: planner_node(
+        cast(ResearchState, state), llm))
+    workflow.add_node("router", lambda state: router_node(
+        cast(ResearchState, state), llm))
+    workflow.add_node("tavily_search", lambda state: tavily_search_node(
+        cast(ResearchState, state), web_search_tool))
+    workflow.add_node("arxiv_search", lambda state: arxiv_search_node(
+        cast(ResearchState, state), arxiv_tool))
+    workflow.add_node("analyze", lambda state: analyze_node(
+        cast(ResearchState, state), llm))
+    workflow.add_node("write", lambda state: write_node(
+        cast(ResearchState, state), llm))
+    workflow.add_node("refine_query", lambda state: refine_query_node(
+        cast(ResearchState, state), llm))
 
     workflow.set_entry_point("planner")
     workflow.add_edge("planner", "router")
@@ -277,6 +322,7 @@ def build_workflow(web_search_tool: TavilySearch, arxiv_tool: ArxivQueryRun, llm
 
     return workflow.compile()
 
+
 def main():
     logger.info("🚀 Iniciando Agente de Pesquisa Autônomo...")
     topic = input("Qual tópico você gostaria de pesquisar? ")
@@ -297,8 +343,8 @@ def main():
         "report_content": "",
         "tool_choice": ""
     }
-
-    final_state = app.invoke(initial_state)
+    config = RunnableConfig(recursion_limit=50)
+    final_state = app.invoke(initial_state, config=config)
 
     logger.info("\n\n--- ✅ PESQUISA CONCLUÍDA ---")
     logger.info("Relatório Final:")
