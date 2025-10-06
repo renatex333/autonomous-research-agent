@@ -44,7 +44,7 @@ LOGGING_CONFIG = {
         },
         "python_multipart": {
             "handlers": ["console"],
-            "level": LOG_LEVEL,
+            "level": "WARNING",
             "propagate": False,
         },
     }
@@ -66,34 +66,35 @@ class ResearchState(TypedDict):
     search_results: str
     decision: str
     report: str
+    current_query: str
     retries: int
 
 def configure_tools():
     """Inicializa as ferramentas e o modelo de linguagem."""
     web_search_tool = TavilySearch(max_results=3)
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = ChatOpenAI(model="gpt-5-nano", temperature=0, service_tier="flex")
     return web_search_tool, llm
 
 def search_node(state: ResearchState, web_search_tool: TavilySearch):
     """Nó para pesquisar na web usando a ferramenta Tavily."""
     logger.info("--- 🔍 NÓ DE PESQUISA ---")
     retries = state.get("retries", 0) + 1
-    topic = state["topic"]
-    results = web_search_tool.invoke({"query": topic})
+    current_query = state["current_query"]
+    results = web_search_tool.invoke({"query": current_query})
     logger.debug("Resultados da pesquisa: %s", results)
     return {"search_results": results, "retries": retries}
 
 def analyze_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para analisar os resultados da pesquisa e decidir o próximo passo."""
     logger.info("--- 🧐 NÓ DE ANÁLISE ---")
-    topic = state["topic"]
+    current_query = state["current_query"]
     search_results = state["search_results"]
 
     response = llm.invoke(f"""
-        Analisando os seguintes resultados de pesquisa sobre o tópico '{topic}':
+        Analisando os seguintes resultados de pesquisa sobre o tópico '{current_query}':
         {search_results}
 
-        A informação é suficiente para escrever um relatório simples?
+        A informação é suficiente para escrever um relatório simples e informativo?
         Responda apenas com 'continue' se for suficiente, ou 'rewrite' se a pesquisa precisar ser refeita com um novo foco.
     """)
 
@@ -104,11 +105,11 @@ def analyze_node(state: ResearchState, llm: ChatOpenAI):
 def write_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para gerar o relatório final com base nos resultados da pesquisa."""
     logger.info("--- ✍️ NÓ DE ESCRITA ---")
-    topic = state["topic"]
+    current_query = state["current_query"]
     search_results = state["search_results"]
 
     response = llm.invoke(f"""
-        Com base nas seguintes informações de pesquisa sobre '{topic}':
+        Com base nas seguintes informações de pesquisa sobre '{current_query}':
         {search_results}
 
         Por favor, escreva um relatório conciso e bem estruturado sobre o tópico.
@@ -117,6 +118,24 @@ def write_node(state: ResearchState, llm: ChatOpenAI):
     report = response.content
     logger.debug("Relatório gerado:\n%s", report)
     return {"report": report}
+
+def refine_query_node(state: ResearchState, llm: ChatOpenAI):
+    """Nó para refinar a consulta de pesquisa com base no feedback do LLM."""
+    logger.info("--- 🔄 NÓ DE REFINAMENTO DE CONSULTA ---")
+    current_query = state["current_query"]
+    previous_results = state["search_results"]
+
+    response = llm.invoke(f"""
+        A pesquisa para o tópico '{current_query}' retornou resultados insatisfatórios:
+        {previous_results}
+        
+        Com base nesses resultados, gere uma nova query de pesquisa, mais específica e focada,
+        para obter informações melhores. Responda apenas com a nova query.
+    """)
+
+    new_query = str(response.content).strip()
+    logger.debug("Nova consulta sugerida: %s", new_query)
+    return {"current_query": new_query}
 
 def should_continue(state: ResearchState):
     """Decide se continua para a escrita ou volta para a pesquisa."""
@@ -136,15 +155,17 @@ def build_workflow(web_search_tool: TavilySearch, llm: ChatOpenAI):
     workflow.add_node("search", lambda state: search_node(cast(ResearchState, state), web_search_tool))
     workflow.add_node("analyze", lambda state: analyze_node(cast(ResearchState, state), llm))
     workflow.add_node("write", lambda state: write_node(cast(ResearchState, state), llm))
+    workflow.add_node("refine_query", lambda state: refine_query_node(cast(ResearchState, state), llm))
 
     workflow.set_entry_point("search")
     workflow.add_edge("search", "analyze")
+    workflow.add_edge("refine_query", "search")
     workflow.add_conditional_edges(
         "analyze",
         should_continue,
         {
             "continue": "write",
-            "rewrite": "search",
+            "rewrite": "refine_query",
         },
     )
     workflow.add_edge("write", END)
@@ -165,6 +186,7 @@ def main():
         "search_results": "",
         "decision": "",
         "report": "",
+        "current_query": topic,
         "retries": 0
     }
 
