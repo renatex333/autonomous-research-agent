@@ -68,6 +68,8 @@ class ResearchState(TypedDict):
     report: str
     current_query: str
     retries: int
+    subtopics: List[str]
+    report_content: str
 
 def configure_tools():
     """Inicializa as ferramentas e o modelo de linguagem."""
@@ -75,23 +77,39 @@ def configure_tools():
     llm = ChatOpenAI(model="gpt-5-nano", temperature=0, service_tier="flex")
     return web_search_tool, llm
 
+def planner_node(state: ResearchState, llm: ChatOpenAI):
+    """Nó para planejar subtemas de pesquisa com base no tópico inicial."""
+    logger.info("--- 🗂️ NÓ DE PLANEJAMENTO ---")
+    topic = state["topic"]
+
+    response = llm.invoke(f"""
+        Para pesquisar sobre '{topic}', divida o tópico em subtemas relevantes.
+        Responda com uma lista de três subtemas, um por linha.
+    """)
+
+    subtopics = str(response.content).strip().split("\n")
+    logger.info("Subtemas gerados: %s", subtopics)
+    return {"subtopics": subtopics, "current_query": subtopics[0] if subtopics else "", "retries": 0}
+
 def search_node(state: ResearchState, web_search_tool: TavilySearch):
     """Nó para pesquisar na web usando a ferramenta Tavily."""
     logger.info("--- 🔍 NÓ DE PESQUISA ---")
     retries = state.get("retries", 0) + 1
+    topic = state["topic"]
     current_query = state["current_query"]
-    results = web_search_tool.invoke({"query": current_query})
-    logger.debug("Resultados da pesquisa: %s", results)
+    results = web_search_tool.invoke({"query": f"{topic}: {current_query}"}).get("results", "")
+    logger.info("Resultados da pesquisa: %s", results)
     return {"search_results": results, "retries": retries}
 
 def analyze_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para analisar os resultados da pesquisa e decidir o próximo passo."""
     logger.info("--- 🧐 NÓ DE ANÁLISE ---")
+    topic = state["topic"]
     current_query = state["current_query"]
     search_results = state["search_results"]
 
     response = llm.invoke(f"""
-        Analisando os seguintes resultados de pesquisa sobre o tópico '{current_query}':
+        Analisando os seguintes resultados de pesquisa sobre o tópico '{topic}' com foco em '{current_query}':
         {search_results}
 
         A informação é suficiente para escrever um relatório simples e informativo?
@@ -99,75 +117,107 @@ def analyze_node(state: ResearchState, llm: ChatOpenAI):
     """)
 
     decision = str(response.content).strip().lower()
-    logger.debug("Decisão da análise: %s", decision)
-    return {"decision": decision}
+    if decision == "continue":
+        _ = state["subtopics"].pop(0) if state["subtopics"] else None
+        state["retries"] = 0
+        state["report_content"] += f"\n{search_results}"
+        if state["subtopics"]:
+            state["current_query"] = state["subtopics"][0]
+            decision = "continue"
+        else:
+            decision = "write"
+    logger.info("Decisão da análise: %s", decision)
+    logger.info("Subtemas restantes: %s", state["subtopics"])
+    logger.info("Conteúdo do relatório atual: %s", state["report_content"])
+    return {
+        "decision": decision,
+        "subtopics": state["subtopics"],
+        "current_query": state["current_query"],
+        "retries": state["retries"],
+        "report_content": state["report_content"]
+    }
+
+def refine_query_node(state: ResearchState, llm: ChatOpenAI):
+    """Nó para refinar a consulta de pesquisa com base no feedback do LLM."""
+    logger.info("--- 🔄 NÓ DE REFINAMENTO DE CONSULTA ---")
+    topic = state["topic"]
+    current_query = state["current_query"]
+    previous_results = state["search_results"]
+
+    response = llm.invoke(f"""
+        A pesquisa para o tópico '{topic}' retornou resultados insatisfatórios:
+        {previous_results}
+        
+        O prompt utilizado foi: '{current_query}'.
+
+        Com base nesses resultados, gere um novo prompt de pesquisa, mais específica e focada,
+        para obter informações melhores. Responda apenas um texto com o novo prompt com no máximo 300 caracteres.
+    """)
+
+    new_query = str(response.content).strip()
+    logger.info("Nova consulta sugerida: %s", new_query)
+    return {"current_query": new_query}
 
 def write_node(state: ResearchState, llm: ChatOpenAI):
     """Nó para gerar o relatório final com base nos resultados da pesquisa."""
     logger.info("--- ✍️ NÓ DE ESCRITA ---")
-    current_query = state["current_query"]
-    search_results = state["search_results"]
+    topic = state["topic"]
+    report_content = state["report_content"]
 
     response = llm.invoke(f"""
-        Com base nas seguintes informações de pesquisa sobre '{current_query}':
-        {search_results}
+        Com base nas seguintes informações de pesquisa sobre '{topic}':
+        {report_content}
 
         Por favor, escreva um relatório conciso e bem estruturado sobre o tópico.
     """)
 
     report = response.content
-    logger.debug("Relatório gerado:\n%s", report)
+    logger.info("Relatório gerado:\n%s", report)
     return {"report": report}
-
-def refine_query_node(state: ResearchState, llm: ChatOpenAI):
-    """Nó para refinar a consulta de pesquisa com base no feedback do LLM."""
-    logger.info("--- 🔄 NÓ DE REFINAMENTO DE CONSULTA ---")
-    current_query = state["current_query"]
-    previous_results = state["search_results"]
-
-    response = llm.invoke(f"""
-        A pesquisa para o tópico '{current_query}' retornou resultados insatisfatórios:
-        {previous_results}
-        
-        Com base nesses resultados, gere uma nova query de pesquisa, mais específica e focada,
-        para obter informações melhores. Responda apenas com a nova query.
-    """)
-
-    new_query = str(response.content).strip()
-    logger.debug("Nova consulta sugerida: %s", new_query)
-    return {"current_query": new_query}
 
 def should_continue(state: ResearchState):
     """Decide se continua para a escrita ou volta para a pesquisa."""
     decision = state["decision"]
     retries = state["retries"]
+    search_results = state["search_results"]
 
     if retries > MAX_RETRIES:
         logger.warning("--- ⚠️ LIMITE DE TENTATIVAS ATINGIDO ---")
-        return "continue"
-
+        _ = state["subtopics"].pop(0) if state["subtopics"] else None
+        state["retries"] = 0
+        state["report_content"] += f"\n{search_results}"
+        if state["subtopics"]:
+            state["current_query"] = state["subtopics"][0]
+            return "continue"
+        return "write"
+    logger.info("Decisão final para o próximo passo: %s", decision)
+    logger.info("Subtemas restantes: %s", state["subtopics"])
+    logger.info("Conteúdo do relatório atual: %s", state["report_content"])
     return "continue" if "continue" in decision else "rewrite"
 
 def build_workflow(web_search_tool: TavilySearch, llm: ChatOpenAI):
     """Monta e compila o grafo de estados."""
     workflow = StateGraph(ResearchState)
 
+    workflow.add_node("planner", lambda state: planner_node(cast(ResearchState, state), llm))
     workflow.add_node("search", lambda state: search_node(cast(ResearchState, state), web_search_tool))
     workflow.add_node("analyze", lambda state: analyze_node(cast(ResearchState, state), llm))
     workflow.add_node("write", lambda state: write_node(cast(ResearchState, state), llm))
     workflow.add_node("refine_query", lambda state: refine_query_node(cast(ResearchState, state), llm))
 
-    workflow.set_entry_point("search")
+    workflow.set_entry_point("planner")
+    workflow.add_edge("planner", "search")
     workflow.add_edge("search", "analyze")
-    workflow.add_edge("refine_query", "search")
     workflow.add_conditional_edges(
         "analyze",
         should_continue,
         {
-            "continue": "write",
+            "continue": "search",
             "rewrite": "refine_query",
+            "write": "write",
         },
     )
+    workflow.add_edge("refine_query", "search")
     workflow.add_edge("write", END)
 
     return workflow.compile()
@@ -187,7 +237,9 @@ def main():
         "decision": "",
         "report": "",
         "current_query": topic,
-        "retries": 0
+        "retries": 0,
+        "subtopics": [],
+        "report_content": ""
     }
 
     final_state = app.invoke(initial_state)
